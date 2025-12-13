@@ -1005,87 +1005,74 @@ void loop() {
       desligarBomba1("Override manual ativo: desligar");
     }
   } else {
-      // Se estamos em periodo de ativacao, priorizar esse fluxo e IGNORAR checagens de OD/Temp
-      if (periodoAtivacaoAtivo) {
-        unsigned long tempoPeriodo = millis() - inicioPeriodoAtivacao;
-        if (tempoPeriodo >= toMS(periodoAtivacao)) {
-          periodoAtivacaoAtivo = false;
-          Serial.println("⏳ Periodo de ativacao finalizado. Voltando às regras normais.");
-          // quando periodoAtivacao termina, desligar bomba se foi ligada por periodo e não houver outra regra mantendo ligada
-          if (bombeouPorTempo && bomba1Ligada) {
-            // desligar somente se não for override manual
-            if (!manualRele1Active) {
-              desligarBomba1("Periodo de ativacao finalizado");
-            }
-          }
-        } else {
-          if (!bomba1Ligada) {
-            Serial.println("🔔 Periodo de ativacao ativo -> ligando bomba1 (periodo). (ignora OD/Temp)");
-            ligarBomba1(true, "Periodo de ativacao (ativo)");
-          }
+    if (odRecebido >= ODMax) {
+      if (bomba1Ligada) {
+        Serial.println("⚠ OD >= ODMax -> Forçando DESLIGAR bomba1 (prioridade OD).");
+        desligarBomba1("OD >= ODMax (prioridade)");
+      }
+    } else {
+      if (temperaturaRecebida < temperaturaMin) {
+        if (bomba1Ligada) {
+          Serial.println("Temp abaixo do mínimo -> desligando bomba1.");
+          desligarBomba1("Temperatura abaixo do mínimo");
+        }
+      } else if (temperaturaRecebida > temperaturaMax) {
+        if (!bomba1Ligada) {
+          Serial.println("Temp acima do max -> tentando LIGAR bomba1 (OD permite).");
+          ligarBomba1(false, "Temperatura acima do máximo");
         }
       } else {
-        // Fora do periodo de ativacao -> comportamento normal, mas se estivermos dentro de uma sessao de multiplicacao
-        // permitimos que a regra de ociosidade (minutosSemMudanca -> minutosLigado) ignore OD/Temp.
-
-        if (odRecebido >= ODMax) {
-          if (!multiplicacaoSessaoAtiva) {
-            if (bomba1Ligada) {
-              Serial.println("⚠ OD >= ODMax -> Forçando DESLIGAR bomba1 (prioridade OD).");
-              desligarBomba1("OD >= ODMax (prioridade)");
-            }
-            // quando não estamos em sessao de multiplicacao, obedecemos OD normalmente
-            // caso estejamos em sessao, pulamos essa restrição
-          }
-        } else {
-          if (temperaturaRecebida < temperaturaMin) {
-            if (!multiplicacaoSessaoAtiva) {
-              if (bomba1Ligada) {
-                Serial.println("Temp abaixo do mínimo -> desligando bomba1.");
-                desligarBomba1("Temperatura abaixo do mínimo");
+        // temp entre min e max
+        if (periodoAtivacaoAtivo) {
+          unsigned long tempoPeriodo = millis() - inicioPeriodoAtivacao;
+          if (tempoPeriodo >= toMS(periodoAtivacao)) {
+            periodoAtivacaoAtivo = false;
+            Serial.println("⏳ Periodo de ativacao finalizado. Voltando às regras normais.");
+            // quando periodoAtivacao termina, desligar bomba se foi ligada por periodo e não houver outra regra mantendo ligada
+            if (bombeouPorTempo && bomba1Ligada) {
+              // desligar somente se não for override manual
+              if (!manualRele1Active) {
+                desligarBomba1("Periodo de ativacao finalizado");
               }
             }
-          } else if (temperaturaRecebida > temperaturaMax) {
-            if (!multiplicacaoSessaoAtiva) {
-              if (!bomba1Ligada) {
-                Serial.println("Temp acima do max -> tentando LIGAR bomba1 (OD permite).\");
-                ligarBomba1(false, "Temperatura acima do máximo");
-              }
-            }
-          }
-
-          // Agora tratamos a regra de periodo/ociosidade quando não estamos no periodo ativo
-          if (!periodoAtivacaoAtivo) {
+          } else {
             if (!bomba1Ligada) {
-              if (tempoDesligadaStart == 0) {
-                tempoDesligadaStart = millis();
-                Serial.println("▶ Contador de tempo desligada da bomba1 iniciado.");
-              } else {
-                unsigned long tempoDesligadaAtual = millis() - tempoDesligadaStart;
-                if (!bomba1Ligada && !bombeouPorTempo && tempoDesligadaAtual >= toMS(minutosSemMudanca)) {
-                  // permitir ligar por ociosidade mesmo que OD/Temp estejam fora, se estivermos em sessao de multiplicacao
-                  if (multiplicacaoSessaoAtiva || odRecebido < ODMax) {
-                    Serial.println("⏱ Bomba1 ficou X minutos desligada -> ligando por Y minutos (regra tempo desligada).");
-                    ligarBomba1(true, "Regra: X minutos desligada -> ligar Y minutos");
-                  } else {
-                    Serial.println("⚠ Tentativa de ligar por tempo bloqueada: OD >= ODMax.");
-                  }
+              Serial.println("🔔 Periodo de ativacao ativo -> ligando bomba1 (periodo).");
+              ligarBomba1(true, "Periodo de ativacao (ativo)");
+            }
+          }
+        }
+
+        if (!periodoAtivacaoAtivo) {
+          if (!bomba1Ligada) {
+            if (tempoDesligadaStart == 0) {
+              tempoDesligadaStart = millis();
+              Serial.println("▶ Contador de tempo desligada da bomba1 iniciado.");
+            } else {
+              unsigned long tempoDesligadaAtual = millis() - tempoDesligadaStart;
+              if (!bomba1Ligada && !bombeouPorTempo && tempoDesligadaAtual >= toMS(minutosSemMudanca)) {
+                if (odRecebido < ODMax) {
+                  Serial.println("⏱ Bomba1 ficou X minutos desligada -> ligando por Y minutos (regra tempo desligada).");
+                  ligarBomba1(true, "Regra: X minutos desligada -> ligar Y minutos");
+                } else {
+                  Serial.println("⚠ Tentativa de ligar por tempo bloqueada: OD >= ODMax.");
                 }
+              }
+            }
+          } else {
+            if (bombeouPorTempo) {
+              unsigned long tempoLigadaAtual = millis() - inicioBombaTempo;
+              if (tempoLigadaAtual >= toMS(minutosLigado)) {
+                Serial.println("⏲ Tempo ligado por regra expirou -> desligando bomba1.");
+                desligarBomba1("Tempo ligado por regra expirou");
               }
             } else {
-              if (bombeouPorTempo) {
-                unsigned long tempoLigadaAtual = millis() - inicioBombaTempo;
-                if (tempoLigadaAtual >= toMS(minutosLigado)) {
-                  Serial.println("⏲ Tempo ligado por regra expirou -> desligando bomba1.");
-                  desligarBomba1("Tempo ligado por regra expirou");
-                }
-              } else {
-                tempoDesligadaStart = 0;
-              }
+              tempoDesligadaStart = 0;
             }
           }
         }
       }
+    }
   }
 
   // ============================================================
