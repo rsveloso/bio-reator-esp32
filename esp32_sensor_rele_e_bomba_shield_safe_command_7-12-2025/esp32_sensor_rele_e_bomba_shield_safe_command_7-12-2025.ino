@@ -77,6 +77,11 @@ unsigned long tempoDesligadaStart = 0;
 bool bombeouPorTempo = false;
 bool bomba1Ligada = false;
 
+// --- ativacao temporaria inicial (quando multiplicaçao inicia)
+unsigned long ativacaoTempInicio = 0;
+unsigned long ativacaoTempDurMs = 0;
+bool ativacaoTemporariaAtiva = false;
+
 // -------------------- CONTROLE MANUAL (NOVO) --------------------
 bool manualRele1Active = false;
 bool manualRele1State = false;
@@ -274,6 +279,33 @@ void ligarBomba1(bool porTempo = false, const char* motivo = "") {
   } else {
     safeSetString("/status/bomba1_motivo", "Indefinido");
     Serial.printf("➡️ Bomba1 LIGADA (porTempo=%d) motivo: Indefinido\n", porTempo ? 1 : 0);
+  }
+}
+
+// Ligar bomba1 por uma duração específica (ms) — usado para ativação inicial na multiplicação
+void ligarBomba1PorDuracao(unsigned long durationMs, const char* motivo = "") {
+  digitalWrite(RELE1_PIN, LOW);
+  bomba1Ligada = true;
+  bombeouPorTempo = true;
+  inicioBombaTempo = millis();
+  ativacaoTemporariaAtiva = true;
+  ativacaoTempInicio = inicioBombaTempo;
+  ativacaoTempDurMs = durationMs;
+  tempoDesligadaStart = 0;
+
+  safeSetString("/status/bomba1", "LIGADA");
+  if (motivo && strlen(motivo) > 0) {
+    safeSetString("/status/bomba1_motivo", String(motivo));
+    Serial.printf("➡️ Bomba1 LIGADA por %lu ms motivo: %s\n", durationMs, motivo);
+  } else {
+    safeSetString("/status/bomba1_motivo", "Ativacao temporaria");
+    Serial.printf("➡️ Bomba1 LIGADA por %lu ms motivo: Ativacao temporaria\n", durationMs);
+  }
+  // Garantir que durante essa ativação temporária os sensores sejam ignorados
+  if (periodoAtivacao > 0) {
+    periodoAtivacaoAtivo = true;
+    inicioPeriodoAtivacao = ativacaoTempInicio;
+    Serial.printf("⏱ Periodo de ativacao forçado iniciado (temporario): %lu minutos\n", periodoAtivacao);
   }
 }
 
@@ -773,10 +805,14 @@ void setup() {
       inicioPeriodoAtivacao = millis();
       Serial.printf("⏱ Periodo de ativacao iniciado (startup): %lu minutos\n", periodoAtivacao);
 
-      if (odRecebido < ODMax && !bomba1Ligada && !manualRele1Active) {
-        ligarBomba1(true, "Periodo de ativacao (inicio - startup)");
-      } else if (!(odRecebido < ODMax)) {
-        Serial.println("⚠ OD já >= ODMax na inicialização: bomba1 permanecerá desligada mesmo no periodo de ativacao.");
+      // ao restaurar sessão em startup, usar somente o tempo de /config/periodo_ativacao
+      if (periodoAtivacao > 0) {
+        unsigned long initialDurationMs = toMS(periodoAtivacao);
+        if (odRecebido < ODMax && !bomba1Ligada && !manualRele1Active) {
+          ligarBomba1PorDuracao(initialDurationMs, "Periodo de ativacao (inicio - startup)");
+        } else if (!(odRecebido < ODMax)) {
+          Serial.println("⚠ OD já >= ODMax na inicialização: bomba1 permanecerá desligada mesmo no periodo de ativacao.");
+        }
       }
     }
   }
@@ -974,19 +1010,24 @@ void loop() {
     safeSetInt("/status/multiplicacao_duracao_minutos", (int)multiplicacaoDuracaoMin);
     Serial.printf("⏱ Sessão de multiplicação iniciada por %lu horas.\n", multiplicacaoDuracaoMin);
 
-    // iniciar periodo de ativacao se configurado
+    // Ao iniciar multiplicação, usar apenas o tempo configurado em /config/periodo_ativacao
     if (periodoAtivacao > 0) {
-      periodoAtivacaoAtivo = true;
-      inicioPeriodoAtivacao = millis();
-      Serial.printf("⏱ Periodo de ativacao iniciado: %lu minutos\n", periodoAtivacao);
+      unsigned long initialDurationMs = toMS(periodoAtivacao);
 
       // somente ligar por periodo se não houver override manual em bomba1 E OD permitir
       if (odRecebido < ODMax) {
-        if (!bomba1Ligada && !manualRele1Active) ligarBomba1(true, "Periodo de ativacao (inicio)");
+        if (!bomba1Ligada && !manualRele1Active) {
+          ligarBomba1PorDuracao(initialDurationMs, "Multiplicacao: ativacao inicial p/ calibracao");
+        }
       } else {
-        Serial.println("⚠ OD >= ODMax no inicio do periodo: bomba1 ficará OFF (prioridade OD).");
-        if (!manualRele1Active) desligarBomba1("OD >= ODMax (periodo inicio)");
+        Serial.println("⚠ OD >= ODMax no inicio da multiplicacao: bomba1 ficará OFF (prioridade OD).");
+        if (!manualRele1Active) desligarBomba1("OD >= ODMax (multiplicacao inicio)");
       }
+
+      // iniciar periodo de ativacao (mantemos a flag para regras posteriores)
+      periodoAtivacaoAtivo = true;
+      inicioPeriodoAtivacao = millis();
+      Serial.printf("⏱ Periodo de ativacao iniciado: %lu minutos\\n", periodoAtivacao);
     }
   }
   multiplicacaoAtivaAnterior = multiplicacaoAtiva;
@@ -1092,11 +1133,20 @@ void loop() {
             }
           } else {
             if (bombeouPorTempo) {
-              unsigned long tempoLigadaAtual = millis() - inicioBombaTempo;
-              if (tempoLigadaAtual >= toMS(minutosLigado)) {
-                Serial.println("⏲ Tempo ligado por regra expirou -> desligando bomba1.");
-                desligarBomba1("Tempo ligado por regra expirou");
-              }
+                unsigned long tempoLigadaAtual = millis() - inicioBombaTempo;
+                if (ativacaoTemporariaAtiva) {
+                  if (tempoLigadaAtual >= ativacaoTempDurMs) {
+                    Serial.println("⏲ Tempo de ativacao temporaria expirou -> desligando bomba1.");
+                    ativacaoTemporariaAtiva = false;
+                    ativacaoTempDurMs = 0;
+                    desligarBomba1("Ativacao temporaria finalizada");
+                  }
+                } else {
+                  if (tempoLigadaAtual >= toMS(minutosLigado)) {
+                    Serial.println("⏲ Tempo ligado por regra expirou -> desligando bomba1.");
+                    desligarBomba1("Tempo ligado por regra expirou");
+                  }
+                }
             } else {
               tempoDesligadaStart = 0;
             }
