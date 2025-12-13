@@ -206,6 +206,22 @@ bool safeSetTimestamp(const char* path) {
   }, path);
 }
 
+// safe delete helper
+bool safeDelete(const char* path) {
+  return safeCommand([&](FirebaseData* fb) {
+    return Firebase.RTDB.deleteNode(fb, path);
+  }, path);
+}
+
+// Remove campos relacionados à sessão de multiplicação no RTDB
+void clearMultiplicacaoStatus() {
+  Serial.println("🧹 Limpando status de multiplicacao no Firebase...");
+  // remover timestamp de início, duração e server_now temporário
+  safeDelete("/status/multiplicacao_inicio");
+  safeDelete("/status/multiplicacao_duracao_minutos");
+  safeDelete("/status/_server_now");
+}
+
 // ----------------------- CONEXÃO WIFI COM FALLBACK -----------------------
 bool conectarWiFi() {
   Serial.println("\n📡 Tentando conectar na Rede 1...");
@@ -736,7 +752,9 @@ void setup() {
             safeSetBool("/config/multiplicacao", false);
             safeSetString("/status/sistema", "desligado");
             safeSetTimestamp("/status/multiplicacao_finalizada");
-            Serial.println("⏳ Sessão de multiplicação já expirou antes do boot — finalizando.");
+            // limpar campos persistentes de sessão para que dashboard não acredite que ainda existe
+            clearMultiplicacaoStatus();
+            Serial.println("⏳ Sessão de multiplicação já expirou antes do boot — finalizando e limpando status.");
           }
         }
       }
@@ -911,6 +929,17 @@ void loop() {
   }
 
   // Se multiplicação desligada -> segurança e leitura ocasional do config
+  // detectar transição TRUE -> FALSE para limpar status persistente no Firebase
+  if (!multiplicacaoAtiva && multiplicacaoAtivaAnterior) {
+    Serial.println("🔕 Multiplicação desativada (queda) — limpando status de sessão no Firebase.");
+    multiplicacaoSessaoAtiva = false;
+    periodoAtivacaoAtivo = false;
+    clearMultiplicacaoStatus();
+    safeSetString("/status/sistema", "desligado");
+    // atualizar histórico da flag anterior para não repetir limpeza
+    multiplicacaoAtivaAnterior = multiplicacaoAtiva;
+  }
+
   if (!multiplicacaoAtiva) {
     Serial.println("⚠ MODO DESLIGADO — Sistema bloqueado.");
 
@@ -973,7 +1002,9 @@ void loop() {
       safeSetBool("/config/multiplicacao", false);
       safeSetString("/status/sistema", "desligado");
       safeSetTimestamp("/status/multiplicacao_finalizada");
-      Serial.println("⏳ Sessão de multiplicação finalizada automaticamente (duracao atingida). multiplicacao setada para FALSE no Firebase.");
+      // limpar campos persistentes de sessão para que dashboard não acredite que ainda existe
+      clearMultiplicacaoStatus();
+      Serial.println("⏳ Sessão de multiplicação finalizada automaticamente (duracao atingida). limpando status e setando multiplicacao=FALSE no Firebase.");
       // respeitar override manual: se manualRele1Active true, não alteramos rele físico aqui
       if (!manualRele1Active) {
         desligarBomba1("Sessão de multiplicação finalizada");
