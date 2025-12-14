@@ -91,7 +91,7 @@ bool manualRele2State = false;
 
 // -------------------- CONFIGURAÇÃO DE RATE-LIMIT / RECUPERAÇÃO --------------------
 
-const unsigned long FIREBASE_STATUS_INTERVAL_MS = 30000;   // enviar leituras ao Firebase a cada 30s
+const unsigned long FIREBASE_STATUS_INTERVAL_MS = 5000;   // enviar leituras ao Firebase a cada 30s
 const unsigned long MIN_FIREBASE_WRITE_INTERVAL_MS = 250; // mínimo entre chamadas seguidas ao RTDB (proteção)
 const int MAX_FIREBASE_ERROR_BEFORE_RESET = 5;
 
@@ -827,6 +827,29 @@ void loop() {
     ESP.restart();
   }
   // ============================================================
+  // RECEBER DADOS DO ARDUINO UNO (prioritário, não-bloqueante)
+  // Ler todas as linhas disponíveis antes de executar operações bloqueantes
+  while (Serial2.available()) {
+    String linha = Serial2.readStringUntil('\n');
+    linha.trim();
+    if (linha.length() == 0) continue;
+
+    int i1 = linha.indexOf("Temp=");
+    int i2 = linha.indexOf(";", i1);
+    if (i1 >= 0 && i2 > i1) temperaturaRecebida = linha.substring(i1 + 5, i2).toFloat();
+
+    i1 = linha.indexOf("OD=");
+    i2 = linha.indexOf(";", i1);
+    if (i1 >= 0 && i2 > i1) odRecebido = linha.substring(i1 + 3, i2).toFloat();
+
+    i1 = linha.indexOf("Dist=");
+    i2 = linha.indexOf(";", i1);
+    if (i1 >= 0 && i2 > i1) distanciaRecebida = linha.substring(i1 + 5, i2).toFloat();
+
+    // debug curto: linha recebida
+    Serial.printf("RX: %s\n", linha.c_str());
+  }
+  // ============================================================
   // 🔔 OUVIR COMANDOS DO DASHBOARD (STREAM DO FIREBASE)
   // ============================================================
   Firebase.RTDB.readStream(&stream);
@@ -925,25 +948,8 @@ void loop() {
       lastTokenReadyMillis = millis();
     }
 
-    //  RECEBER DADOS DO ARDUINO UNO
-  // ============================================================
-  if (Serial2.available()) {
-    String linha = Serial2.readStringUntil('\n');
-
-    int i1 = linha.indexOf("Temp=");
-    int i2 = linha.indexOf(";", i1);
-    if (i1 >= 0 && i2 > i1) temperaturaRecebida = linha.substring(i1 + 5, i2).toFloat();
-
-    i1 = linha.indexOf("OD=");
-    i2 = linha.indexOf(";", i1);
-    if (i1 >= 0 && i2 > i1) odRecebido = linha.substring(i1 + 3, i2).toFloat();
-
-    i1 = linha.indexOf("Dist=");
-    i2 = linha.indexOf(";", i1);
-    if (i1 >= 0 && i2 > i1) distanciaRecebida = linha.substring(i1 + 5, i2).toFloat();
-  }
-
-  // Print para conferência
+  
+  // Print para conferência (valores atualizados pela leitura prioritária Serial2 acima)
   Serial.printf("Temp: %.2f | OD: %.2f | Dist: %.2f\n",
                 temperaturaRecebida, odRecebido, distanciaRecebida);
 
@@ -1018,6 +1024,9 @@ void loop() {
       if (odRecebido < ODMax) {
         if (!bomba1Ligada && !manualRele1Active) {
           ligarBomba1PorDuracao(initialDurationMs, "Multiplicacao: ativacao inicial p/ calibracao");
+          // salvar início e duração do periodo no Firebase para o dashboard
+            safeSetTimestamp("/status/periodo_ativacao_inicio");
+            safeSetInt("/status/periodo_ativacao_minutos", (int)periodoAtivacao);
         }
       } else {
         Serial.println("⚠ OD >= ODMax no inicio da multiplicacao: bomba1 ficará OFF (prioridade OD).");
@@ -1107,6 +1116,10 @@ void loop() {
                 desligarBomba1("Periodo de ativacao finalizado");
               }
             }
+            // limpar status de periodo no Firebase
+            safeDelete("/status/periodo_ativacao_inicio");
+            safeDelete("/status/periodo_ativacao_minutos");
+            safeSetTimestamp("/status/periodo_ativacao_finalizada");
           } else {
             if (!bomba1Ligada) {
               Serial.println("🔔 Periodo de ativacao ativo -> ligando bomba1 (periodo).");
@@ -1169,5 +1182,5 @@ void loop() {
     }
   }
 
-  delay(200); // pausa curta para aliviar CPU
+  delay(10); // pausa curta para aliviar CPU
 }
