@@ -23,6 +23,8 @@ FirebaseData stream; // data object usado para stream
 // ------------------- PINOS DOS RELES -------------------------
 #define RELE1_PIN 14   // Rele 1 - Bomba1 (temperatura + OD)
 #define RELE2_PIN 27   // Rele 2 - Bomba2 (distância)
+#define RESISTENCIA1_PIN 26 // Resistencia controlada pelo sensor Temp1
+#define RESISTENCIA2_PIN 25 // Resistencia controlada pelo sensor Temp2
 
 // ------------------- PINOS conexão Arduino x Esp32 -------------------------
 #define RXD2 16
@@ -51,11 +53,18 @@ unsigned long multiplicacaoDuracaoMin = 60; // padrão 1 hora (60 minutos)
 
 // -------------------- VARIÁVEIS PARA VALORES RECEBIDOS ----------------------
 float temperaturaRecebida = 0.0;
+float temperatura2Recebida = 0.0;
 float odRecebido = 0.0;
+float phRecebido = 0.0;
 
 // -------------------- VARIÁVEIS PADRÃO (configuráveis via Firebase) --------------------
-float temperaturaMax = 35.0;
-float temperaturaMin = 28.0;
+bool modoSemOD = false;
+float temperaturaMax1 = 35.0;
+float temperaturaMin1 = 28.0;
+float temperaturaMax2 = 35.0;
+float temperaturaMin2 = 28.0;
+float phMin = 0.0;
+float phMax = 14.0;
 
 float ODMax = 30.0;
 float ODMin = 10.0;
@@ -76,6 +85,8 @@ bool periodoAtivacaoAtivo = false;
 unsigned long tempoDesligadaStart = 0;
 bool bombeouPorTempo = false;
 bool bomba1Ligada = false;
+bool resistencia1Ligada = false;
+bool resistencia2Ligada = false;
 
 // --- ativacao temporaria inicial (quando multiplicaçao inicia)
 unsigned long ativacaoTempInicio = 0;
@@ -342,6 +353,97 @@ void desligarBomba2(const char* motivo = "") {
   Serial.println("⛔ Bomba2 DESLIGADA (distância)");
 }
 
+void definirResistencia1(bool ligada, const char* motivo) {
+  if (resistencia1Ligada == ligada) return;
+  digitalWrite(RESISTENCIA1_PIN, ligada ? LOW : HIGH);
+  resistencia1Ligada = ligada;
+  safeSetString("/status/resistencia1", ligada ? "LIGADA" : "DESLIGADA");
+  Serial.printf("Resistencia 1 %s: %s\n", ligada ? "LIGADA" : "DESLIGADA", motivo);
+}
+
+void definirResistencia2(bool ligada, const char* motivo) {
+  if (resistencia2Ligada == ligada) return;
+  digitalWrite(RESISTENCIA2_PIN, ligada ? LOW : HIGH);
+  resistencia2Ligada = ligada;
+  safeSetString("/status/resistencia2", ligada ? "LIGADA" : "DESLIGADA");
+  Serial.printf("Resistencia 2 %s: %s\n", ligada ? "LIGADA" : "DESLIGADA", motivo);
+}
+
+bool leituraTemperatura1Valida() {
+  return temperaturaRecebida > 0.0 && temperaturaRecebida <= 100.0;
+}
+
+bool leituraTemperatura2Valida() {
+  return temperatura2Recebida > -55.0 && temperatura2Recebida <= 125.0;
+}
+
+void controlarResistenciasSemOD() {
+  if (!modoSemOD) {
+    definirResistencia1(false, "modo Com OD");
+    definirResistencia2(false, "modo Com OD");
+    return;
+  }
+
+  // Falha de sensor ou faixa de configuração inválida mantém a resistência desligada.
+  if (!leituraTemperatura1Valida() || temperaturaMin1 >= temperaturaMax1) {
+    definirResistencia1(false, "Temp1 inválida ou limites incorretos");
+  } else if (temperaturaRecebida < temperaturaMin1) {
+    definirResistencia1(true, "Temp1 abaixo do mínimo");
+  } else if (temperaturaRecebida > temperaturaMax1) {
+    definirResistencia1(false, "Temp1 acima do máximo");
+  }
+
+  if (!leituraTemperatura2Valida() || temperaturaMin2 >= temperaturaMax2) {
+    definirResistencia2(false, "Temp2 inválida ou limites incorretos");
+  } else if (temperatura2Recebida < temperaturaMin2) {
+    definirResistencia2(true, "Temp2 abaixo do mínimo");
+  } else if (temperatura2Recebida > temperaturaMax2) {
+    definirResistencia2(false, "Temp2 acima do máximo");
+  }
+}
+
+// Em Sem OD, o comando manual prevalece. Em AUTO, a bomba fica ligada
+// durante a multiplicação; fora dela, usa a histerese térmica de Temp1.
+void controlarBomba1SemOD() {
+  // Sem OD nao usa temporizadores da logica antiga da bomba. Limpa estados
+  // remanescentes caso o toggle tenha sido alterado durante um ciclo temporizado.
+  bool haviaTemporizadorAtivo = periodoAtivacaoAtivo || bombeouPorTempo || ativacaoTemporariaAtiva;
+  periodoAtivacaoAtivo = false;
+  bombeouPorTempo = false;
+  ativacaoTemporariaAtiva = false;
+  ativacaoTempDurMs = 0;
+  tempoDesligadaStart = 0;
+
+  if (haviaTemporizadorAtivo) {
+    safeDelete("/status/periodo_ativacao_inicio");
+    safeDelete("/status/periodo_ativacao_minutos");
+    safeSetTimestamp("/status/periodo_ativacao_finalizada");
+    Serial.println("Sem OD: periodo de ativacao e tempo ocioso ignorados; temporizadores limpos.");
+  }
+
+  if (manualRele1Active) {
+    if (manualRele1State && !bomba1Ligada) {
+      ligarBomba1(false, "Override manual ativo: ligar");
+    } else if (!manualRele1State && bomba1Ligada) {
+      desligarBomba1("Override manual ativo: desligar");
+    }
+    return;
+  }
+
+  if (multiplicacaoAtiva) {
+    if (!bomba1Ligada) ligarBomba1(false, "Sem OD: bomba ativa durante multiplicação");
+    return;
+  }
+
+  if (!leituraTemperatura1Valida() || temperaturaMin1 >= temperaturaMax1) {
+    if (bomba1Ligada) desligarBomba1("Sem OD: Temp1 inválida ou limites incorretos");
+  } else if (temperaturaRecebida < temperaturaMin1) {
+    if (bomba1Ligada) desligarBomba1("Sem OD: Temp1 abaixo do mínimo");
+  } else if (temperaturaRecebida > temperaturaMax1) {
+    if (!bomba1Ligada) ligarBomba1(false, "Sem OD: Temp1 acima do máximo");
+  }
+}
+
 // ----------- DESLIGAR COMPLETAMENTE O CONTROLE DA BOMBA2 ----------
 void desligarControleBomba2() {
   Serial.println("⛔ Controle da Bomba2 DESATIVADO manualmente.");
@@ -426,9 +528,9 @@ void processBomba2Control() {
 
 // -------------------- VALIDA SENSORES ------------------------
 bool sensoresValidos() {
-  // Validar apenas temperatura e OD inicialmente; distância é opcional
-  if (temperaturaRecebida <= 0 || odRecebido <= 0) {
-    Serial.println("⚠ ALERTA: Leitura inválida detectada (Temp/OD 0 ou negativo).");
+  // Em Sem OD, o valor de OD continua sendo recebido, mas não bloqueia os controles.
+  if (temperaturaRecebida <= 0 || (!modoSemOD && odRecebido <= 0)) {
+    Serial.println("⚠ ALERTA: Leitura inválida detectada (Temp1/OD).");
     return false;
   }
   if (temperaturaRecebida < -10 || temperaturaRecebida > 100) {
@@ -489,18 +591,45 @@ void desligarTodasBombasPorSeguranca() {
 void atualizarConfigFirebase() {
   Serial.println("🔄 Atualizando variáveis de configuração do Firebase...");
 
-  // Temperatura
-  if (Firebase.RTDB.getFloat(&fbdo, "/config/temperatura_max")) {
-    temperaturaMax = fbdo.floatData();
+  // Toggle Com OD / Sem OD (padrão: Com OD para preservar o comportamento atual)
+  if (Firebase.RTDB.getBool(&fbdo, "/config/sem_od")) {
+    modoSemOD = fbdo.boolData();
   } else {
-    Serial.println("⚠ /config/temperatura_max não encontrado (mantendo padrão).");
+    modoSemOD = false;
+    safeSetBool("/config/sem_od", false);
+    Serial.println("Criado /config/sem_od = false (Com OD)");
   }
 
-  if (Firebase.RTDB.getFloat(&fbdo, "/config/temperatura_min")) {
-    temperaturaMin = fbdo.floatData();
+  // Temp1 migra dos caminhos antigos para os nomes explícitos temperatura_min1/max1.
+  if (Firebase.RTDB.getFloat(&fbdo, "/config/temperatura_max1")) {
+    temperaturaMax1 = fbdo.floatData();
+  } else if (Firebase.RTDB.getFloat(&fbdo, "/config/temperatura_max")) {
+    temperaturaMax1 = fbdo.floatData();
+    safeSetFloat("/config/temperatura_max1", temperaturaMax1);
   } else {
-    Serial.println("⚠ /config/temperatura_min não encontrado (mantendo padrão).");
+    safeSetFloat("/config/temperatura_max1", temperaturaMax1);
   }
+
+  if (Firebase.RTDB.getFloat(&fbdo, "/config/temperatura_min1")) {
+    temperaturaMin1 = fbdo.floatData();
+  } else if (Firebase.RTDB.getFloat(&fbdo, "/config/temperatura_min")) {
+    temperaturaMin1 = fbdo.floatData();
+    safeSetFloat("/config/temperatura_min1", temperaturaMin1);
+  } else {
+    safeSetFloat("/config/temperatura_min1", temperaturaMin1);
+  }
+
+  if (Firebase.RTDB.getFloat(&fbdo, "/config/temperatura_max2")) temperaturaMax2 = fbdo.floatData();
+  else safeSetFloat("/config/temperatura_max2", temperaturaMax2);
+
+  if (Firebase.RTDB.getFloat(&fbdo, "/config/temperatura_min2")) temperaturaMin2 = fbdo.floatData();
+  else safeSetFloat("/config/temperatura_min2", temperaturaMin2);
+
+  if (Firebase.RTDB.getFloat(&fbdo, "/config/ph_min")) phMin = fbdo.floatData();
+  else safeSetFloat("/config/ph_min", phMin);
+
+  if (Firebase.RTDB.getFloat(&fbdo, "/config/ph_max")) phMax = fbdo.floatData();
+  else safeSetFloat("/config/ph_max", phMax);
 
   // Tempo
   if (Firebase.RTDB.getInt(&fbdo, "/config/intervalo_ligado")) {
@@ -600,8 +729,10 @@ void atualizarConfigFirebase() {
   safeSetString("/status/sistema", multiplicacaoAtiva ? "ligado" : "desligado");
 
   Serial.println("✔ Configurações atualizadas:");
-  Serial.printf("TempMax: %.2f\n", temperaturaMax);
-  Serial.printf("TempMin: %.2f\n", temperaturaMin);
+  Serial.printf("Modo OD: %s\n", modoSemOD ? "Sem OD" : "Com OD");
+  Serial.printf("Temp1 Min/Max: %.2f / %.2f\n", temperaturaMin1, temperaturaMax1);
+  Serial.printf("Temp2 Min/Max: %.2f / %.2f\n", temperaturaMin2, temperaturaMax2);
+  Serial.printf("pH Min/Max (sem controle): %.2f / %.2f\n", phMin, phMax);
   Serial.printf("Ligado(Y): %lu min\n", minutosLigado);
   Serial.printf("Desligada(X): %lu min\n", minutosSemMudanca);
   Serial.printf("ODMax: %.2f\n", ODMax);
@@ -704,10 +835,14 @@ void setup() {
 
   pinMode(RELE1_PIN, OUTPUT);
   pinMode(RELE2_PIN, OUTPUT);
+  pinMode(RESISTENCIA1_PIN, OUTPUT);
+  pinMode(RESISTENCIA2_PIN, OUTPUT);
 
-  // Garantir estado inicial (reles HIGH = desligado)
+  // Garantir estado inicial (reles ativos em LOW; HIGH = desligado)
   digitalWrite(RELE1_PIN, HIGH);
   digitalWrite(RELE2_PIN, HIGH);
+  digitalWrite(RESISTENCIA1_PIN, HIGH);
+  digitalWrite(RESISTENCIA2_PIN, HIGH);
 
   // WiFi
   Serial.print("Conectando ao WiFi...");
@@ -741,6 +876,8 @@ void setup() {
 
   ultimoTempoMudanca = millis();
   atualizarConfigFirebase(); // carrega valores do Firebase na inicialização
+  safeSetString("/status/resistencia1", "DESLIGADA");
+  safeSetString("/status/resistencia2", "DESLIGADA");
 
   // INICIAR STREAM PARA OUVIR COMANDOS DO DASHBOARD
   if (!Firebase.RTDB.beginStream(&stream, "/comandos")) {
@@ -800,7 +937,7 @@ void setup() {
       Serial.printf("🔔 Multiplicação já ativa na inicialização: sessão iniciada por %lu horas\n", multiplicacaoDuracaoMin);
     }
 
-    if (periodoAtivacao > 0) {
+    if (periodoAtivacao > 0 && !modoSemOD) {
       periodoAtivacaoAtivo = true;
       inicioPeriodoAtivacao = millis();
       Serial.printf("⏱ Periodo de ativacao iniciado (startup): %lu minutos\n", periodoAtivacao);
@@ -838,9 +975,17 @@ void loop() {
     int i2 = linha.indexOf(";", i1);
     if (i1 >= 0 && i2 > i1) temperaturaRecebida = linha.substring(i1 + 5, i2).toFloat();
 
+    i1 = linha.indexOf("Temp2=");
+    i2 = linha.indexOf(";", i1);
+    if (i1 >= 0 && i2 > i1) temperatura2Recebida = linha.substring(i1 + 6, i2).toFloat();
+
     i1 = linha.indexOf("OD=");
     i2 = linha.indexOf(";", i1);
     if (i1 >= 0 && i2 > i1) odRecebido = linha.substring(i1 + 3, i2).toFloat();
+
+    i1 = linha.indexOf("pH=");
+    i2 = linha.indexOf(";", i1);
+    if (i1 >= 0 && i2 > i1) phRecebido = linha.substring(i1 + 3, i2).toFloat();
 
     i1 = linha.indexOf("Dist=");
     i2 = linha.indexOf(";", i1);
@@ -950,8 +1095,8 @@ void loop() {
 
   
   // Print para conferência (valores atualizados pela leitura prioritária Serial2 acima)
-  Serial.printf("Temp: %.2f | OD: %.2f | Dist: %.2f\n",
-                temperaturaRecebida, odRecebido, distanciaRecebida);
+  Serial.printf("Temp: %.2f | Temp2: %.2f | OD: %.2f | Dist: %.2f\n",
+                temperaturaRecebida, temperatura2Recebida, odRecebido, distanciaRecebida);
 
   // Envia para Firebase periodicamente (rate-limited)
   unsigned long now = millis();
@@ -960,7 +1105,11 @@ void loop() {
 
     if (WiFi.status() == WL_CONNECTED) {
       safeSetFloat("/status/temperatura", temperaturaRecebida);
+      bool temperatura2Salva = safeSetFloat("/status/temperatura2", temperatura2Recebida);
+      Serial.printf("Firebase /status/temperatura2 = %.2f (%s)\n",
+                    temperatura2Recebida, temperatura2Salva ? "OK" : "FALHA");
       safeSetFloat("/status/od", odRecebido);
+      safeSetFloat("/status/ph", phRecebido);
       safeSetFloat("/status/distancia", distanciaRecebida);
       safeSetTimestamp("/status/ultima_atualizacao");
     } else {
@@ -976,16 +1125,33 @@ void loop() {
     Serial.println("🔕 Multiplicação desativada (queda) — limpando status de sessão no Firebase.");
     multiplicacaoSessaoAtiva = false;
     periodoAtivacaoAtivo = false;
+    if (modoSemOD && !manualRele1Active && bomba1Ligada) {
+      desligarBomba1("Fim da multiplicação em Sem OD");
+    }
     clearMultiplicacaoStatus();
     safeSetString("/status/sistema", "desligado");
     // atualizar histórico da flag anterior para não repetir limpeza
     multiplicacaoAtivaAnterior = multiplicacaoAtiva;
   }
 
+  if (modoSemOD && !multiplicacaoAtiva) {
+    definirResistencia1(false, "multiplicacao desativada");
+    definirResistencia2(false, "multiplicacao desativada");
+  } else {
+    controlarResistenciasSemOD();
+  }
+  if (modoSemOD) controlarBomba1SemOD();
+
   if (!multiplicacaoAtiva) {
     Serial.println("⚠ MODO DESLIGADO — Sistema bloqueado.");
 
-    desligarTodasBombasPorSeguranca();
+    if (!modoSemOD) {
+      desligarTodasBombasPorSeguranca();
+    } else {
+      bombeouPorTempo = false;
+      periodoAtivacaoAtivo = false;
+      multiplicacaoSessaoAtiva = false;
+    }
 
     if (millis() - ultimaLeituraFirebase > 3000) {
         ultimaLeituraFirebase = millis();
@@ -1017,7 +1183,7 @@ void loop() {
     Serial.printf("⏱ Sessão de multiplicação iniciada por %lu horas.\n", multiplicacaoDuracaoMin);
 
     // Ao iniciar multiplicação, usar apenas o tempo configurado em /config/periodo_ativacao
-    if (periodoAtivacao > 0) {
+    if (periodoAtivacao > 0 && !modoSemOD) {
       unsigned long initialDurationMs = toMS(periodoAtivacao);
 
       // somente ligar por periodo se não houver override manual em bomba1 E OD permitir
@@ -1077,8 +1243,9 @@ void loop() {
   processBomba2Control();
 
   // ======================================================================
-  // LÓGICA BOMBA 1 (TEMPERATURA + OD + PERIODOS) - com suporte a periodoAtivacao já existente
+  // LÓGICA LEGADA BOMBA 1 (mantida quando o modo Com OD está selecionado)
   // ======================================================================
+  if (!modoSemOD) {
   if (manualRele1Active) {
     if (manualRele1State && !bomba1Ligada) {
       ligarBomba1(false, "Override manual ativo: ligar");
@@ -1092,12 +1259,12 @@ void loop() {
         desligarBomba1("OD >= ODMax (prioridade)");
       }
     } else {
-      if (temperaturaRecebida < temperaturaMin) {
+      if (temperaturaRecebida < temperaturaMin1) {
         if (bomba1Ligada) {
           Serial.println("Temp abaixo do mínimo -> desligando bomba1.");
           desligarBomba1("Temperatura abaixo do mínimo");
         }
-      } else if (temperaturaRecebida > temperaturaMax) {
+      } else if (temperaturaRecebida > temperaturaMax1) {
         if (!bomba1Ligada) {
           Serial.println("Temp acima do max -> tentando LIGAR bomba1 (OD permite).");
           ligarBomba1(false, "Temperatura acima do máximo");
@@ -1167,6 +1334,7 @@ void loop() {
         }
       }
     }
+  }
   }
 
   // ============================================================
